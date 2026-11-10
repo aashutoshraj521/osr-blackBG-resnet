@@ -1,0 +1,27 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints and Trained Models
+checkpoints/
+*.pth
+*.pt
+
+# Datasets
+data/
+
+# Temporary Outputs & Logs
+match_results/
+output_*.png
+*.log
+
+# System & IDE files
+.DS_Store
+.idea/
+.vscode/
