@@ -196,6 +196,9 @@ class OSREvaluator:
             backbone=self.config["backbone"],
             feature_dim=self.config["feature_dim"],
             temperature=self.config["temperature"],
+            pretrained=False,
+            dropout=self.config.get("dropout", 0.0),
+            margin=0.0,
         ).to(self.device)
 
         model_weights = self.checkpoint_dir / "best_model.pth"
@@ -243,7 +246,7 @@ class OSREvaluator:
                 preds = match_res["predicted_class_idx"].cpu().numpy()
                 labels_np = labels.numpy()
 
-                for sc, pred, target in zip(scores, preds, labels_np):
+                for i, (sc, pred, target) in enumerate(zip(scores, preds, labels_np)):
                     is_pos = (target >= 0)
                     all_scores.append(float(sc))
                     all_is_known.append(is_pos)
@@ -256,7 +259,7 @@ class OSREvaluator:
 
                     if is_pos:
                         # Extract unthresholded best class index for closed-set evaluation
-                        top_class = int(np.argmax(match_res["all_scores"][len(known_targets) % len(scores)].cpu().numpy()))
+                        top_class = int(np.argmax(match_res["all_scores"][i].cpu().numpy()))
                         known_targets.append(int(target))
                         known_preds.append(top_class)
                         known_scores.append(float(sc))

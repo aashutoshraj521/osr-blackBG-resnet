@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from dataset import create_osr_dataloaders
+from dataset import BlackBackgroundTransforms, OSRImageDataset, create_osr_dataloaders
 from models import OSRObjectMatcherModel, build_model
 
 
@@ -109,7 +109,7 @@ def train_one_epoch(
 
         # In training, labels are guaranteed to be >= 0 (known classes)
         optimizer.zero_grad()
-        logits, cosine_sim, _ = model(images)
+        logits, cosine_sim, _ = model(images, targets=labels)
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
@@ -164,13 +164,19 @@ def evaluate_known_val(
 def train_model(
     data_dir: str,
     output_dir: str = "./checkpoints",
-    backbone: str = "simple_cnn",
+    backbone: str = "resnet18",
     feature_dim: int = 256,
-    epochs: int = 20,
-    batch_size: int = 32,
+    epochs: int = 25,
+    batch_size: int = 16,
     lr: float = 1e-3,
+    backbone_lr: Optional[float] = None,
     weight_decay: float = 1e-4,
     temperature: float = 0.1,
+    margin: float = 0.15,
+    label_smoothing: float = 0.05,
+    dropout: float = 0.2,
+    pretrained: bool = True,
+    freeze_backbone: bool = False,
     known_classes: Optional[List[str]] = None,
     num_known_classes: Optional[int] = None,
     known_ratio: float = 0.8,
@@ -222,13 +228,40 @@ def train_model(
         backbone=backbone,
         feature_dim=feature_dim,
         temperature=temperature,
-        pretrained=False,
+        pretrained=pretrained,
+        margin=margin,
+        dropout=dropout,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    # Differential learning rate or frozen backbone
+    if freeze_backbone and hasattr(model.backbone, "conv1"):
+        for name, param in model.backbone.named_parameters():
+            if not name.startswith("projection"):
+                param.requires_grad = False
+        trainable_params = list(model.backbone.projection.parameters()) + list(model.classifier.parameters())
+        optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
+        print(f"[Train] Robust Setup: Pretrained {backbone.upper()} (FROZEN BACKBONE), Head LR={lr:g}, Margin={margin}, LabelSmoothing={label_smoothing}, Dropout={dropout}")
+    elif pretrained and hasattr(model.backbone, "conv1"):
+        bb_lr = backbone_lr if backbone_lr is not None else (lr * 0.1)
+        backbone_params = []
+        for name, param in model.backbone.named_parameters():
+            if not name.startswith("projection"):
+                backbone_params.append(param)
+        head_params = list(model.backbone.projection.parameters()) + list(model.classifier.parameters())
+        optimizer = optim.AdamW([
+            {"params": backbone_params, "lr": bb_lr, "weight_decay": weight_decay},
+            {"params": head_params, "lr": lr, "weight_decay": weight_decay},
+        ])
+        print(f"[Train] Robust Setup: Pretrained {backbone.upper()}, Backbone LR={bb_lr:g}, Head LR={lr:g}, Margin={margin}, LabelSmoothing={label_smoothing}, Dropout={dropout}")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        print(f"[Train] Standard Setup: Backbone={backbone}, LR={lr:g}, Margin={margin}")
+
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
 
+    best_val_loss = float("inf")
     best_val_acc = -1.0
     best_epoch = 0
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -253,22 +286,42 @@ def train_model(
 
         print(f" {epoch:^7d} | {tr_loss:^12.4f} | {tr_acc*100:^10.2f}% | {val_loss:^12.4f} | {val_acc*100:^10.2f}%")
 
-        # Save Best Model Checkpoint
-        if val_acc > best_val_acc:
+        # Save Best Model Checkpoint based on validation loss and accuracy
+        is_best = False
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_val_acc = max(best_val_acc, val_acc)
+            best_epoch = epoch
+            is_best = True
+        elif val_acc > best_val_acc and val_loss <= best_val_loss * 1.15:
             best_val_acc = val_acc
             best_epoch = epoch
+            is_best = True
+
+        if is_best:
             torch.save(model.state_dict(), out_path / "best_model.pth")
 
     total_training_time = time.time() - t_start
     print(line)
-    print(f"[Train] Training complete in {total_training_time:.1f}s. Best Val Accuracy: {best_val_acc*100:.2f}% (Epoch {best_epoch})")
+    print(f"[Train] Training complete in {total_training_time:.1f}s. Best Epoch: {best_epoch} (Val Loss: {best_val_loss:.4f}, Val Acc: {best_val_acc*100:.2f}%)")
 
     # 4. Load best model weights
     model.load_state_dict(torch.load(out_path / "best_model.pth", map_location=device))
 
-    # 5. Compute Empirical Centroid Prototypes on training set
-    print("[Train] Computing empirical class centroid prototypes...")
-    prototypes = model.update_empirical_prototypes(train_loader, device=device)
+    # 5. Compute Empirical Centroid Prototypes on training set using canonical eval transforms
+    print("[Train] Computing empirical class centroid prototypes with canonical transforms...")
+    eval_transform = BlackBackgroundTransforms(target_size=target_size, is_training=False)
+    canonical_train_dataset = OSRImageDataset(
+        train_loader.dataset.samples,
+        class_to_idx=class_to_idx,
+        transform=eval_transform,
+    )
+    canonical_train_loader = torch.utils.data.DataLoader(
+        canonical_train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    prototypes = model.update_empirical_prototypes(canonical_train_loader, device=device)
     torch.save(prototypes.cpu(), out_path / "prototypes.pt")
 
     # 6. Calibrate Open-Set Decision Thresholds
@@ -288,10 +341,16 @@ def train_model(
         "feature_dim": feature_dim,
         "num_classes": num_classes,
         "temperature": temperature,
+        "margin": margin,
+        "dropout": dropout,
+        "label_smoothing": label_smoothing,
+        "pretrained": pretrained,
+        "freeze_backbone": freeze_backbone,
         "target_size": list(target_size),
         "known_classes": known_cls,
         "unknown_classes": unknown_cls,
         "best_epoch": best_epoch,
+        "best_val_loss": round(best_val_loss, 4),
         "best_val_acc": round(best_val_acc * 100.0, 2),
         "total_training_time_s": round(total_training_time, 2),
         "calibrated_thresholds": thresholds,
@@ -315,9 +374,17 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training and validation.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
+    parser.add_argument("--backbone-lr", type=float, default=None, help="Learning rate for pretrained backbone (defaults to lr * 0.1).")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW.")
     parser.add_argument("--temperature", type=float, default=0.1, help="Temperature scaling factor.")
+    parser.add_argument("--margin", type=float, default=0.15, help="CosFace additive angular margin on cosine similarity.")
+    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout probability in projection head.")
+    parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing factor for CrossEntropyLoss.")
+    parser.add_argument("--pretrained", dest="pretrained", action="store_true", default=True, help="Use ImageNet pretrained weights for backbone.")
+    parser.add_argument("--no-pretrained", dest="pretrained", action="store_false", help="Do not load pretrained backbone weights.")
+    parser.add_argument("--freeze-backbone", action="store_true", default=False, help="Freeze convolutional backbone layers to preserve ImageNet features.")
     parser.add_argument("--num-known", type=int, default=None, help="Number of classes to designate as known.")
+    parser.add_argument("--known-classes", type=str, nargs="+", default=None, help="Explicit list of known class names.")
     parser.add_argument("--known-ratio", type=float, default=0.8, help="Fraction of classes designated as known if num-known is omitted.")
     parser.add_argument("--target-size", type=int, nargs=2, default=[224, 224], metavar=("WIDTH", "HEIGHT"), help="Input image size.")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"], help="Compute device.")
@@ -335,8 +402,15 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        backbone_lr=args.backbone_lr,
         weight_decay=args.weight_decay,
         temperature=args.temperature,
+        margin=args.margin,
+        label_smoothing=args.label_smoothing,
+        dropout=args.dropout,
+        pretrained=args.pretrained,
+        freeze_backbone=args.freeze_backbone,
+        known_classes=args.known_classes,
         num_known_classes=args.num_known,
         known_ratio=args.known_ratio,
         target_size=tuple(args.target_size),

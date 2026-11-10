@@ -216,6 +216,26 @@ class TestOSRPipeline(unittest.TestCase):
         self.assertTrue(vis_path.exists())
         self.assertEqual(vis.size[1], 320 + 70)
 
+    def test_07_cifar_plus_10_protocol(self):
+        """Test CIFAR+10 protocol class partition and comparison sheet generator."""
+        from download_cifar_plus_10 import NEAL_KNOWN_4, FULL_KNOWN_10, OSR_UNKNOWN_10, create_cifar_comparison_sheet
+        # Known and unknown must be disjoint
+        self.assertTrue(set(NEAL_KNOWN_4).isdisjoint(set(OSR_UNKNOWN_10)))
+        self.assertTrue(set(FULL_KNOWN_10).isdisjoint(set(OSR_UNKNOWN_10)))
+        self.assertEqual(len(OSR_UNKNOWN_10), 10)
+        self.assertEqual(len(NEAL_KNOWN_4), 4)
+
+        # Test sheet generation with synthetic image
+        img = Image.new("RGB", (32, 32), (100, 150, 200))
+        black = Image.new("RGB", (32, 32), (0, 0, 0))
+        sheet_path = self.temp_dir / "test_sheet.png"
+        create_cifar_comparison_sheet(
+            raw_images=[("airplane", img)],
+            black_images=[("airplane", black)],
+            save_path=sheet_path,
+        )
+        self.assertTrue(sheet_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,7 @@ Raw Input Dataset / Query Image
 ```
 osr-project/
 ├── bg_removal.py               # Modular PyTorch background removal & alpha matting
+├── download_cifar_plus_10.py   # Downloader & black background processor for CIFAR+10 benchmark
 ├── dataset_preprocessor.py     # Batch foreground extractor & black-background converter
 ├── dataset.py                  # OSR Dataset, DataLoaders, & black-border augmentations
 ├── models.py                   # SimpleConvNet, ResNet, Cosine Classifier, OSRObjectMatcherModel
@@ -100,9 +101,26 @@ pip install -r requirements.txt
 
 ---
 
-### 2. Prepare / Generate Dataset
+### 2. Prepare Dataset: CIFAR+10 OSR Benchmark
 
-You can use your own dataset or generate a synthetic benchmark dataset:
+Download and preprocess the standard Open Set Recognition **CIFAR+10** benchmark (4 known classes from CIFAR-10, 10 non-overlapping unknown classes from CIFAR-100), converting backgrounds into pure black `(0, 0, 0)`:
+
+```bash
+# Download and preprocess CIFAR+10 with RMBG-1.4 onto solid black background:
+python3 download_cifar_plus_10.py \
+    -o ./data/cifar_plus_10 \
+    -p neal \
+    -n 20 \
+    --target-size 224 224
+
+# Directory structure created:
+# ./data/cifar_plus_10/
+# ├── raw/             <- Original CIFAR images organized by class
+# ├── black/           <- Processed images with pure black background (0, 0, 0)
+# └── cifar_plus_10_comparison.png <- Side-by-side visual comparison sheet
+```
+
+Alternatively, you can generate a synthetic multi-class dataset for quick local testing:
 
 ```bash
 # Generate a sample multi-class dataset with known and unknown classes

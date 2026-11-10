@@ -82,6 +82,7 @@ class ResNetBackbone(nn.Module):
         arch: str = "resnet18",
         pretrained: bool = False,
         feature_dim: int = 256,
+        dropout: float = 0.0,
     ):
         super().__init__()
         weights = "DEFAULT" if pretrained else None
@@ -108,10 +109,20 @@ class ResNetBackbone(nn.Module):
         self.layer4 = resnet.layer4
         self.avgpool = resnet.avgpool
 
-        self.projection = nn.Sequential(
-            nn.Linear(in_dim, feature_dim, bias=False),
-            nn.BatchNorm1d(feature_dim),
-        )
+        if dropout > 0:
+            self.projection = nn.Sequential(
+                nn.Linear(in_dim, feature_dim, bias=False),
+                nn.BatchNorm1d(feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=dropout),
+                nn.Linear(feature_dim, feature_dim, bias=False),
+                nn.BatchNorm1d(feature_dim),
+            )
+        else:
+            self.projection = nn.Sequential(
+                nn.Linear(in_dim, feature_dim, bias=False),
+                nn.BatchNorm1d(feature_dim),
+            )
         self.output_dim = feature_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -174,12 +185,14 @@ class CosineMetricClassifier(nn.Module):
         num_classes: int,
         feature_dim: int = 256,
         temperature: float = 0.1,
+        margin: float = 0.0,
         learnable_scale: bool = False,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.feature_dim = feature_dim
         self.temperature = temperature
+        self.margin = margin
 
         # Learnable class prototype vectors on unit hypersphere
         self.weight = nn.Parameter(torch.empty(num_classes, feature_dim))
@@ -194,10 +207,11 @@ class CosineMetricClassifier(nn.Module):
         """Returns L2-normalized class prototypes [num_classes, feature_dim]."""
         return F.normalize(self.weight, p=2, dim=1)
 
-    def forward(self, embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, embeddings: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             embeddings: [batch_size, feature_dim] unnormalized or normalized features.
+            targets: Optional [batch_size] ground truth labels for angular margin penalty.
 
         Returns:
             (scaled_logits [batch_size, num_classes], cosine_similarities [batch_size, num_classes])
@@ -210,8 +224,16 @@ class CosineMetricClassifier(nn.Module):
         # Cosine similarity in range [-1, 1]
         cosine_sim = F.linear(norm_z, norm_w)
 
-        # Scaled logits for cross entropy
-        logits = cosine_sim * self.scale
+        # CosFace additive angular margin penalty during training on target class
+        if self.training and self.margin > 0.0 and targets is not None:
+            one_hot = F.one_hot(targets.clamp(min=0), num_classes=self.num_classes).float()
+            # Only apply margin to valid known classes (labels >= 0)
+            valid_mask = (targets >= 0).float().unsqueeze(1)
+            margin_sim = cosine_sim - (one_hot * self.margin * valid_mask)
+            logits = margin_sim * self.scale
+        else:
+            logits = cosine_sim * self.scale
+
         return logits, cosine_sim
 
 
@@ -232,27 +254,32 @@ class OSRObjectMatcherModel(nn.Module):
         feature_dim: int = 256,
         temperature: float = 0.1,
         pretrained: bool = False,
+        margin: float = 0.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.feature_dim = feature_dim
         self.backbone_name = backbone_name
+        self.margin = margin
+        self.dropout = dropout
 
         # 1. Initialize backbone
         if backbone_name == "simple_cnn":
             self.backbone = SimpleConvNet(feature_dim=feature_dim)
         elif backbone_name.startswith("resnet"):
-            self.backbone = ResNetBackbone(arch=backbone_name, pretrained=pretrained, feature_dim=feature_dim)
+            self.backbone = ResNetBackbone(arch=backbone_name, pretrained=pretrained, feature_dim=feature_dim, dropout=dropout)
         elif backbone_name == "mobilenet_v3":
             self.backbone = MobileNetV3Backbone(pretrained=pretrained, feature_dim=feature_dim)
         else:
             raise ValueError(f"Unknown backbone: '{backbone_name}'")
 
-        # 2. Cosine Metric Classifier
+        # 2. Cosine Metric Classifier with margin support
         self.classifier = CosineMetricClassifier(
             num_classes=num_classes,
             feature_dim=feature_dim,
             temperature=temperature,
+            margin=margin,
         )
 
         # Stored empirical centroids (updated after training for highest matching accuracy)
@@ -266,14 +293,14 @@ class OSRObjectMatcherModel(nn.Module):
             feat = F.normalize(feat, p=2, dim=1)
         return feat
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
         Returns:
             (scaled_logits, cosine_similarities, normalized_embeddings)
         """
         z = self.extract_embedding(x, normalize=True)
-        logits, cosine_sim = self.classifier(z)
+        logits, cosine_sim = self.classifier(z, targets=targets)
         return logits, cosine_sim, z
 
     def update_empirical_prototypes(self, loader: torch.utils.data.DataLoader, device: torch.device) -> torch.Tensor:
@@ -395,6 +422,8 @@ def build_model(
     feature_dim: int = 256,
     temperature: float = 0.1,
     pretrained: bool = False,
+    margin: float = 0.0,
+    dropout: float = 0.0,
 ) -> OSRObjectMatcherModel:
     """Build and initialize OSRObjectMatcherModel."""
     return OSRObjectMatcherModel(
@@ -403,4 +432,6 @@ def build_model(
         feature_dim=feature_dim,
         temperature=temperature,
         pretrained=pretrained,
+        margin=margin,
+        dropout=dropout,
     )
