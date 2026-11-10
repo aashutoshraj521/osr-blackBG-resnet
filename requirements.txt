@@ -1,0 +1,14 @@
+# Core PyTorch & Vision Dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Hugging Face Model Loading
+transformers>=4.40.0
+accelerate>=0.28.0
+huggingface-hub>=0.20.0
+
+# Image Processing & Utilities
+pillow>=10.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
