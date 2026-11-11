@@ -40,6 +40,7 @@ def calibrate_thresholds(
     model: OSRObjectMatcherModel,
     val_loader: torch.utils.data.DataLoader,
     device: torch.device,
+    scoring_method: str = "auto",
 ) -> Dict[str, float]:
     """
     Calibrate Open-Set decision thresholds based on known validation samples.
@@ -47,7 +48,7 @@ def calibrate_thresholds(
     - tau_95: Accepts 95% of known objects (5th percentile)
     - tau_99: Accepts 99% of known objects (1st percentile)
     - tau_mean: Mean known score
-    - tau_recommended: Conservative threshold balancing acceptance and rejection
+    - tau_recommended: Recommended decision threshold
     """
     model.eval()
     all_scores: List[float] = []
@@ -63,12 +64,13 @@ def calibrate_thresholds(
                 continue
 
             valid_imgs = images[mask]
-            match_res = model.match_object(valid_imgs, threshold=0.0)
+            match_res = model.match_object(valid_imgs, threshold=-1e9, scoring_method=scoring_method)
             scores = match_res["confidence_score"].cpu().numpy().tolist()
             all_scores.extend(scores)
 
     if not all_scores:
-        return {"tau_95": 0.5, "tau_99": 0.4, "tau_recommended": 0.5}
+        default_tau = 0.5 if getattr(model, "classifier_type", "cosine") == "cosine" else 0.0
+        return {"tau_95": default_tau, "tau_99": default_tau, "tau_recommended": default_tau}
 
     arr = np.array(all_scores)
     tau_99 = float(np.percentile(arr, 1.0))
@@ -77,8 +79,12 @@ def calibrate_thresholds(
     tau_mean = float(np.mean(arr))
     tau_std = float(np.std(arr))
 
-    # Recommended threshold: clamp(tau_95, 0.40, 0.85)
-    rec = max(0.35, min(0.85, tau_95))
+    # For cosine similarity, clamp recommended tau to [0.35, 0.85]
+    # For MLS linear classifier (unbounded logits), use exact tau_95
+    if getattr(model, "classifier_type", "cosine") == "linear":
+        rec = tau_95
+    else:
+        rec = max(0.35, min(0.85, tau_95))
 
     return {
         "tau_99": round(tau_99, 4),
@@ -165,6 +171,8 @@ def train_model(
     data_dir: str,
     output_dir: str = "./checkpoints",
     backbone: str = "resnet18",
+    classifier_type: str = "cosine",
+    scoring_method: str = "auto",
     feature_dim: int = 256,
     epochs: int = 25,
     batch_size: int = 16,
@@ -186,6 +194,7 @@ def train_model(
 ) -> Dict:
     """
     Full training routine for the Open Set Recognition & Object Matching system.
+    Supports both Thesis Metric Learning (cosine) and Paper Baseline (linear + MLS).
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -218,6 +227,7 @@ def train_model(
     num_classes = len(known_cls)
     idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
 
+    print(f"[Train] Paradigm: {'Thesis Metric Learning (Cosine Prototypes)' if classifier_type == 'cosine' else 'Paper Baseline (Vaze et al., CVPR 2022 Linear MLS)'}")
     print(f"[Train] Known classes ({num_classes}): {known_cls}")
     print(f"[Train] Unknown (Open-Set) classes ({len(unknown_cls)}): {unknown_cls}")
     print(f"[Train] Samples: Train={len(train_loader.dataset)}, Val={len(val_loader.dataset)}, Test={len(test_loader.dataset)}")
@@ -226,6 +236,7 @@ def train_model(
     model = build_model(
         num_classes=num_classes,
         backbone=backbone,
+        classifier_type=classifier_type,
         feature_dim=feature_dim,
         temperature=temperature,
         pretrained=pretrained,
@@ -308,25 +319,26 @@ def train_model(
     # 4. Load best model weights
     model.load_state_dict(torch.load(out_path / "best_model.pth", map_location=device))
 
-    # 5. Compute Empirical Centroid Prototypes on training set using canonical eval transforms
-    print("[Train] Computing empirical class centroid prototypes with canonical transforms...")
-    eval_transform = BlackBackgroundTransforms(target_size=target_size, is_training=False)
-    canonical_train_dataset = OSRImageDataset(
-        train_loader.dataset.samples,
-        class_to_idx=class_to_idx,
-        transform=eval_transform,
-    )
-    canonical_train_loader = torch.utils.data.DataLoader(
-        canonical_train_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-    prototypes = model.update_empirical_prototypes(canonical_train_loader, device=device)
-    torch.save(prototypes.cpu(), out_path / "prototypes.pt")
+    # 5. Compute Empirical Centroid Prototypes on training set (for cosine metric learning)
+    if classifier_type == "cosine":
+        print("[Train] Computing empirical class centroid prototypes with canonical transforms...")
+        eval_transform = BlackBackgroundTransforms(target_size=target_size, is_training=False)
+        canonical_train_dataset = OSRImageDataset(
+            train_loader.dataset.samples,
+            class_to_idx=class_to_idx,
+            transform=eval_transform,
+        )
+        canonical_train_loader = torch.utils.data.DataLoader(
+            canonical_train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        prototypes = model.update_empirical_prototypes(canonical_train_loader, device=device)
+        torch.save(prototypes.cpu(), out_path / "prototypes.pt")
 
     # 6. Calibrate Open-Set Decision Thresholds
     print("[Train] Calibrating Open-Set decision thresholds on validation set...")
-    thresholds = calibrate_thresholds(model, val_loader, device=device)
+    thresholds = calibrate_thresholds(model, val_loader, device=device, scoring_method=scoring_method)
     print(f"[Train] Calibrated Thresholds: {thresholds}")
 
     # 7. Save Mappings & Config
@@ -338,6 +350,8 @@ def train_model(
 
     config_info = {
         "backbone": backbone,
+        "classifier_type": classifier_type,
+        "scoring_method": scoring_method,
         "feature_dim": feature_dim,
         "num_classes": num_classes,
         "temperature": temperature,
@@ -370,6 +384,8 @@ def parse_args():
     parser.add_argument("-d", "--data-dir", required=True, type=str, help="Directory containing preprocessed black-background dataset.")
     parser.add_argument("-o", "--output-dir", default="./checkpoints", type=str, help="Directory to save model checkpoints and prototypes.")
     parser.add_argument("--backbone", default="simple_cnn", choices=["simple_cnn", "resnet18", "resnet34", "resnet50", "mobilenet_v3"], help="Backbone architecture.")
+    parser.add_argument("--classifier-type", default="cosine", choices=["cosine", "linear"], help="Classifier head: 'cosine' (Thesis prototype metric) or 'linear' (Paper baseline).")
+    parser.add_argument("--scoring-method", default="auto", choices=["auto", "cosine", "mls", "msp"], help="Inference scoring method.")
     parser.add_argument("--feature-dim", type=int, default=256, help="Dimension of embedding space.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training and validation.")
@@ -398,6 +414,8 @@ def main():
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         backbone=args.backbone,
+        classifier_type=args.classifier_type,
+        scoring_method=args.scoring_method,
         feature_dim=args.feature_dim,
         epochs=args.epochs,
         batch_size=args.batch_size,

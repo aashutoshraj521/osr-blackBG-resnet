@@ -190,10 +190,14 @@ class OSREvaluator:
         else:
             self.device = torch.device("cpu")
 
+        self.classifier_type = self.config.get("classifier_type", "cosine")
+        self.scoring_method = self.config.get("scoring_method", "auto")
+
         # Build & Load model
         self.model = build_model(
             num_classes=self.num_classes,
             backbone=self.config["backbone"],
+            classifier_type=self.classifier_type,
             feature_dim=self.config["feature_dim"],
             temperature=self.config["temperature"],
             pretrained=False,
@@ -217,10 +221,12 @@ class OSREvaluator:
         self,
         test_loader: torch.utils.data.DataLoader,
         threshold: Optional[float] = None,
+        scoring_method: Optional[str] = None,
     ) -> Dict:
         """
         Evaluate full test set (knowns + unknowns).
         """
+        active_scoring = scoring_method or self.scoring_method
         if threshold is None:
             # Use recommended calibrated threshold from config
             threshold = self.config.get("calibrated_thresholds", {}).get("tau_recommended", 0.5)
@@ -240,7 +246,7 @@ class OSREvaluator:
         with torch.no_grad():
             for images, labels, _, _ in test_loader:
                 images = images.to(self.device)
-                match_res = self.model.match_object(images, threshold=threshold)
+                match_res = self.model.match_object(images, threshold=threshold, scoring_method=active_scoring)
 
                 scores = match_res["confidence_score"].cpu().numpy()
                 preds = match_res["predicted_class_idx"].cpu().numpy()
@@ -403,6 +409,7 @@ def parse_args():
     parser.add_argument("-d", "--data-dir", required=True, type=str, help="Directory containing preprocessed black-background dataset.")
     parser.add_argument("-c", "--checkpoint-dir", required=True, type=str, help="Directory containing model checkpoints (best_model.pth, config.json).")
     parser.add_argument("-t", "--threshold", type=float, default=None, help="OSR decision threshold (default: use calibrated value).")
+    parser.add_argument("--scoring-method", default=None, choices=["auto", "mls", "msp", "cosine"], help="Scoring method to override config.")
     parser.add_argument("-o", "--output-report", type=str, default=None, help="Path to save evaluation_report.json.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"], help="Inference device.")
@@ -425,7 +432,7 @@ def main():
         target_size=target_size,
     )
 
-    report = evaluator.evaluate(test_loader=test_loader, threshold=args.threshold)
+    report = evaluator.evaluate(test_loader=test_loader, threshold=args.threshold, scoring_method=args.scoring_method)
 
     out_json = args.output_report or str(Path(args.checkpoint_dir) / "evaluation_report.json")
     with open(out_json, "w") as f:

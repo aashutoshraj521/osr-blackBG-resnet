@@ -168,8 +168,25 @@ class MobileNetV3Backbone(nn.Module):
 
 
 # ==============================================================================
-# Metric Learning Cosine Classifier
+# Metric Learning Cosine Classifier & Standard Linear Classifier Heads
 # ==============================================================================
+
+class LinearClassifier(nn.Module):
+    """
+    Standard Closed-Set Linear Classifier Head (as in Vaze et al., CVPR 2022).
+    Maps penultimate feature embeddings directly to unconstrained logits:
+        l_k(x) = w_k^T z + b_k
+    Used for Maximum Logit Score (MLS) baseline.
+    """
+
+    def __init__(self, in_features: int, num_classes: int):
+        super().__init__()
+        self.fc = nn.Linear(in_features, num_classes)
+
+    def forward(self, embeddings: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = self.fc(embeddings)
+        return logits, logits
+
 
 class CosineMetricClassifier(nn.Module):
     """
@@ -244,13 +261,16 @@ class CosineMetricClassifier(nn.Module):
 class OSRObjectMatcherModel(nn.Module):
     """
     Unified Open Set Recognition and Object Matching Model.
-    Combines Backbone Feature Extractor + Hyperspherical Prototype Classifier + OSR Decision Logic.
+    Supports both:
+    1. Thesis Metric Paradigm: Backbone + CosineMetricClassifier (with empirical prototypes)
+    2. Paper Baseline Paradigm (Vaze et al., CVPR 2022): Backbone + LinearClassifier (MLS / MSP)
     """
 
     def __init__(
         self,
         num_classes: int,
         backbone_name: str = "simple_cnn",
+        classifier_type: str = "cosine",
         feature_dim: int = 256,
         temperature: float = 0.1,
         pretrained: bool = False,
@@ -261,6 +281,7 @@ class OSRObjectMatcherModel(nn.Module):
         self.num_classes = num_classes
         self.feature_dim = feature_dim
         self.backbone_name = backbone_name
+        self.classifier_type = classifier_type.lower()
         self.margin = margin
         self.dropout = dropout
 
@@ -274,15 +295,20 @@ class OSRObjectMatcherModel(nn.Module):
         else:
             raise ValueError(f"Unknown backbone: '{backbone_name}'")
 
-        # 2. Cosine Metric Classifier with margin support
-        self.classifier = CosineMetricClassifier(
-            num_classes=num_classes,
-            feature_dim=feature_dim,
-            temperature=temperature,
-            margin=margin,
-        )
+        # 2. Classifier Head
+        if self.classifier_type == "linear":
+            self.classifier = LinearClassifier(in_features=feature_dim, num_classes=num_classes)
+        elif self.classifier_type == "cosine":
+            self.classifier = CosineMetricClassifier(
+                num_classes=num_classes,
+                feature_dim=feature_dim,
+                temperature=temperature,
+                margin=margin,
+            )
+        else:
+            raise ValueError(f"Unsupported classifier_type: '{classifier_type}'. Choose 'cosine' or 'linear'.")
 
-        # Stored empirical centroids (updated after training for highest matching accuracy)
+        # Stored empirical centroids (updated after training for cosine prototype matching)
         self.register_buffer("empirical_prototypes", torch.zeros(num_classes, feature_dim))
         self.register_buffer("has_empirical_prototypes", torch.tensor(False))
 
@@ -297,11 +323,12 @@ class OSRObjectMatcherModel(nn.Module):
         """
         Forward pass.
         Returns:
-            (scaled_logits, cosine_similarities, normalized_embeddings)
+            (logits, similarities_or_logits, embeddings)
         """
-        z = self.extract_embedding(x, normalize=True)
-        logits, cosine_sim = self.classifier(z, targets=targets)
-        return logits, cosine_sim, z
+        normalize = (self.classifier_type == "cosine")
+        z = self.extract_embedding(x, normalize=normalize)
+        logits, aux = self.classifier(z, targets=targets)
+        return logits, aux, z
 
     def update_empirical_prototypes(self, loader: torch.utils.data.DataLoader, device: torch.device) -> torch.Tensor:
         """
@@ -363,40 +390,62 @@ class OSRObjectMatcherModel(nn.Module):
         self,
         x: torch.Tensor,
         threshold: float = 0.5,
-        scoring_method: str = "cosine",
+        scoring_method: str = "auto",
     ) -> Dict[str, Union[torch.Tensor, np.ndarray]]:
         """
         Perform Open Set Recognition & Object Matching.
 
         Args:
-            x: Preprocessed tensor batch [B, 3, H, W] (black-background object).
-            threshold: OSR acceptance threshold. If max_score < threshold -> UNKNOWN (-1).
-            scoring_method: "cosine" (max cosine similarity) or "msp" (maximum softmax probability).
+            x: Preprocessed tensor batch [B, 3, H, W] (black-background object or raw image).
+            threshold: OSR acceptance threshold. If confidence < threshold -> UNKNOWN (-1).
+            scoring_method:
+                - "auto": "mls" if linear classifier, else "cosine"
+                - "mls": Maximum Logit Score (Vaze et al., CVPR 2022)
+                - "msp": Maximum Softmax Probability
+                - "cosine": Normalized cosine similarity to prototypes in [0, 1]
 
         Returns:
             Dictionary containing:
             - 'predicted_class_idx': Predicted known class index, or -1 for unknown.
-            - 'confidence_score': Matching confidence score in [0, 1].
+            - 'confidence_score': Matching confidence score.
             - 'is_known': Boolean flag whether object is matched to known class.
-            - 'all_similarities': Full similarity vector to all known classes.
+            - 'all_similarities': Full similarity / logit vector to all known classes.
+            - 'all_scores': Raw confidence distribution across classes.
             - 'embeddings': Feature vector.
         """
         self.eval()
         with torch.no_grad():
-            z = self.extract_embedding(x, normalize=True)
-            similarities = self.compute_similarity_to_prototypes(z)  # [B, K]
+            if scoring_method == "auto":
+                scoring_method = "mls" if self.classifier_type == "linear" else "cosine"
 
-            # Convert cosine [-1, 1] to normalized score [0, 1]
-            cosine_scores = (similarities + 1.0) / 2.0
+            if scoring_method == "mls":
+                # Maximum Logit Score (Vaze et al., CVPR 2022 paper baseline)
+                z = self.extract_embedding(x, normalize=(self.classifier_type == "cosine"))
+                logits, _ = self.classifier(z)
+                confidence, pred_k = torch.max(logits, dim=1)
+                all_scores = logits
+                similarities = logits
 
-            if scoring_method == "cosine":
-                confidence, pred_k = torch.max(cosine_scores, dim=1)
             elif scoring_method == "msp":
-                logits = similarities / self.classifier.temperature
+                # Maximum Softmax Probability baseline
+                z = self.extract_embedding(x, normalize=(self.classifier_type == "cosine"))
+                logits, _ = self.classifier(z)
                 probs = F.softmax(logits, dim=1)
                 confidence, pred_k = torch.max(probs, dim=1)
+                all_scores = probs
+                similarities = logits
+
+            elif scoring_method == "cosine":
+                # Hyperspherical Prototype Metric Learning (Thesis method)
+                z = self.extract_embedding(x, normalize=True)
+                similarities = self.compute_similarity_to_prototypes(z)  # [B, K]
+                # Convert cosine [-1, 1] to normalized score [0, 1]
+                cosine_scores = (similarities + 1.0) / 2.0
+                confidence, pred_k = torch.max(cosine_scores, dim=1)
+                all_scores = cosine_scores
+
             else:
-                raise ValueError(f"Unknown scoring_method: {scoring_method}")
+                raise ValueError(f"Unknown scoring_method: '{scoring_method}'. Choose 'auto', 'mls', 'msp', or 'cosine'.")
 
             # Open Set Decision: if confidence < threshold -> reject as Unknown (-1)
             is_known = confidence >= threshold
@@ -407,7 +456,7 @@ class OSRObjectMatcherModel(nn.Module):
                 "confidence_score": confidence,
                 "is_known": is_known,
                 "all_similarities": similarities,
-                "all_scores": cosine_scores,
+                "all_scores": all_scores,
                 "embeddings": z,
             }
 
@@ -419,6 +468,7 @@ class OSRObjectMatcherModel(nn.Module):
 def build_model(
     num_classes: int,
     backbone: str = "simple_cnn",
+    classifier_type: str = "cosine",
     feature_dim: int = 256,
     temperature: float = 0.1,
     pretrained: bool = False,
@@ -429,6 +479,7 @@ def build_model(
     return OSRObjectMatcherModel(
         num_classes=num_classes,
         backbone_name=backbone,
+        classifier_type=classifier_type,
         feature_dim=feature_dim,
         temperature=temperature,
         pretrained=pretrained,
